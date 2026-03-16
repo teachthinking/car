@@ -60,7 +60,7 @@ function initializeRoom(room) {
   room.objects = [];
   room.events = [];
   room.eventObjects = []; // 固定型事件的矩形障礙（施工/車禍）
-  room.goal = { x: 745, y: 490, w: 55, h: 80 };
+  room.goal = { x: 740, y: 480, w: 60, h: 80 };  // 完整覆蓋右側垂直道路寬度
   room.objects = [
     { type: 'building', x: 85, y: 85, w: 170, h: 170 },
     { type: 'park', x: 325, y: 85, w: 170, h: 170 },
@@ -234,6 +234,22 @@ function castRay(x, y, angleDeg, objects, npcs, eventObjects) {
   return MAX_SENSOR_DIST;
 }
 
+
+// ============================================================
+// 感測器統一計算（避免重複傳遞相同參數）
+// ============================================================
+function castAllSensors(player, room) {
+  const { objects, npcs, eventObjects } = room;
+  const { x, y, angle } = player;
+  return {
+    f:  castRay(x, y, angle,      objects, npcs, eventObjects),
+    l:  castRay(x, y, angle - 45, objects, npcs, eventObjects),
+    r:  castRay(x, y, angle + 45, objects, npcs, eventObjects),
+    fl: castRay(x, y, angle - 90, objects, npcs, eventObjects),
+    fr: castRay(x, y, angle + 90, objects, npcs, eventObjects),
+  };
+}
+
 // ============================================================
 // AI 視覺辨識射線（感知 Perception & 預測 Prediction）
 // ============================================================
@@ -320,7 +336,7 @@ function getOrCreateRoom(roomId) {
       active: true,
       objects: [],
       tracks: [],
-      goal: { x: 745, y: 490, w: 55, h: 80 },
+      goal: { x: 740, y: 480, w: 60, h: 80 },
       startPoint: { x: 60, y: 60, angle: 0 },
       players: {},
       npcs: [],
@@ -334,21 +350,35 @@ function getOrCreateRoom(roomId) {
   return rooms[roomId];
 }
 
+
+// ============================================================
+// 重置單一玩家到房間起點
+// ============================================================
+function resetPlayer(player, room) {
+  player.x       = room.startPoint.x;
+  player.y       = room.startPoint.y;
+  player.angle   = room.startPoint.angle;
+  player.speed   = 0;
+  player.steering = 0;
+  player.crashes = 0;
+  player.eventPenalties = 0;
+  player.score   = 200;
+  player.finished = false;
+  // 清除所有偵測旗標，避免重置後殘留
+  player._prevHitBuilding    = false;
+  player._prevHitBoundary    = false;
+  player._prevHitConstruction = false;
+  player._prevHitPedestrian  = false;
+  player._prevRunRedLight    = false;
+  player._prevWrongWay       = false;
+  player._rlState            = {};   // 清除各路口越線狀態
+}
+
 // ============================================================
 // 重置房間內所有學員車輛至起點
 // ============================================================
 function resetAllPlayersInRoom(room) {
-  for (let pid in room.players) {
-    let p = room.players[pid];
-    p.x = room.startPoint.x;
-    p.y = room.startPoint.y;
-    p.angle = room.startPoint.angle;
-    p.speed = 0;
-    p.steering = 0;
-    p.crashes = 0;
-    p.eventPenalties = 0;
-    p.finished = false;
-  }
+  for (let pid in room.players) resetPlayer(room.players[pid], room);
 }
 
 // ============================================================
@@ -426,9 +456,12 @@ io.on('connection', (socket) => {
   });
 
   // 教師更新地圖（新增/刪除建築物等）
+  // roomId 優先從 data.roomId 取得（教師端直接傳），fallback 才用 socket.roomId
   socket.on('updateMap', (mapData) => {
-    if (!socket.roomId) return;
-    let currentRoom = getOrCreateRoom(socket.roomId);
+    const roomId = mapData.roomId || socket.roomId;
+    if (!roomId) return;
+    if (!socket.roomId) { socket.join(roomId); socket.roomId = roomId; } // 自動補 join
+    let currentRoom = getOrCreateRoom(roomId);
     currentRoom.objects = mapData.objects || [];
     currentRoom.goal = mapData.goal || currentRoom.goal;
     currentRoom.tracks = mapData.tracks || [];
@@ -467,8 +500,8 @@ io.on('connection', (socket) => {
     currentRoom.eventCooldowns = {};
 
     // 廣播新地圖給該房間所有學員
-    console.log(`[updateMap] 房間${socket.roomId} events:`, currentRoom.events);
-    io.to(socket.roomId).emit('map', {
+    if (process.env.DEBUG) console.log(`[updateMap] 房間${roomId} events:`, currentRoom.events);
+    io.to(roomId).emit('map', {
       objects: currentRoom.objects,
       goal: currentRoom.goal,
       tracks: currentRoom.tracks,
@@ -484,9 +517,13 @@ io.on('connection', (socket) => {
     let p = currentRoom.players[data.id];
     if (!p) return;
     if (data.action === 'motor') {
-      p.speed = Number(data.val);
+      // 速度限制 -5~5，並加入輕微慣性讓行為更自然
+      let target = Math.max(-5, Math.min(5, Number(data.val)));
+      p.speed = p.speed + (target - p.speed) * 0.4; // 40% 慣性插值
+      if (Math.abs(p.speed) < 0.05) p.speed = 0;   // 消除微小殘留
     } else if (data.action === 'steer') {
-      p.steering = Number(data.val);
+      // 方向盤角度限制 -15~15
+      p.steering = Math.max(-15, Math.min(15, Number(data.val)));
     }
   });
 
@@ -520,14 +557,7 @@ io.on('connection', (socket) => {
     if (!player) return;
 
     // 重置到房間起點
-    player.x = currentRoom.startPoint.x;
-    player.y = currentRoom.startPoint.y;
-    player.angle = currentRoom.startPoint.angle;
-    player.speed = 0;
-    player.steering = 0;
-    player.crashes = 0;
-    player.eventPenalties = 0;
-    player.finished = false;
+    resetPlayer(player, currentRoom);
 
     // 可選：通知該學生重置完成
     socket.emit('self_reset_confirmed');
@@ -584,7 +614,7 @@ setInterval(() => {
         if (Math.random() > 0.10) continue; // 每 tick 10% 機率出現（平均 0.5 秒）
 
         let lifespan = 100 + Math.floor(Math.random() * 100); // 5~10 秒
-        console.log(`[行人事件] 房間 ${currentRoom.roomId} 事件 ${evt.id} 出現，存活 ${lifespan} ticks`);
+        if (process.env.DEBUG) console.log(`[行人事件] 房間 ${currentRoom.roomId} 事件 ${evt.id} 出現，存活 ${lifespan} ticks`);
         currentRoom.npcs.push({
           id: 'event_' + Date.now() + Math.random(),
           eventId: evt.id,
@@ -794,39 +824,109 @@ setInterval(() => {
       let p = currentRoom.players[id];
       if (p.finished) continue;
 
-      p.angle += p.steering;
+      // ── Bug 1 修正：只有車輛移動中才累積角度，停車時清除方向盤殘留 ──
+      if (Math.abs(p.speed) > 0.05) {
+        p.angle += p.steering;
+      } else {
+        p.steering = 0; // 停車時方向盤自動歸零，防止原地轉頭
+      }
+
       let rad = p.angle * Math.PI / 180;
       let nextX = p.x + Math.cos(rad) * p.speed;
       let nextY = p.y + Math.sin(rad) * p.speed;
 
+      // ── 車道吸附（Lane Snapping）：同時修正位置與車頭角度 ──
+      // 修正條件：
+      //   1. 有速度、方向盤接近直行（±3°）
+      //   2. 不在交叉口區域（避免轉彎被硬拉回舊車道）
+      //   3. 以車子「主要移動方向」決定只吸附水平或垂直車道，不能同時觸發
+      if (Math.abs(p.speed) > 0.1 && Math.abs(p.steering) < 3) {
+        const POS_STRENGTH   = 0.10;
+        const ANGLE_STRENGTH = 0.06; // 角度修正更保守，避免急轉
+        const SNAP_RANGE     = 20;   // 縮小到 20px，減少誤觸發
+
+        // 不在交叉口才吸附（交叉口豁免，與逆向偵測邏輯一致）
+        const atIntersection = currentRoom.trafficLights.some(
+          tl => Math.hypot(p.x - tl.cx, p.y - tl.cy) < 60
+        );
+
+        if (!atIntersection) {
+          const snapRad = p.angle * Math.PI / 180;
+          const cosA = Math.cos(snapRad);
+          const sinA = Math.sin(snapRad);
+          // 以移動方向決定吸附軸：主要往水平走 → 吸附水平車道，反之亦然
+          const mainlyHorizontal = Math.abs(cosA) >= Math.abs(sinA);
+
+          // 輔助：角度差歸一化到 -180~180
+          function snapAngleDiff(target, current) {
+            let d = ((target - current) % 360 + 360) % 360; // 先轉成 0~360
+            if (d > 180) d -= 360;
+            return d;
+          }
+
+          if (mainlyHorizontal) {
+            // 水平車道吸附：只吸附「行駛方向相符」的車道，避免被吸到對向
+            for (let lane of ROAD_LANES.hLanes) {
+              // 方向相符判斷：dir=1 車道玩家應往右(cosA>0)，dir=-1 應往左(cosA<0)
+              const dirMatch = (lane.dir > 0 && cosA > 0) || (lane.dir < 0 && cosA < 0);
+              if (!dirMatch) continue;
+              if (Math.abs(nextY - lane.y) < SNAP_RANGE) {
+                nextY += (lane.y - nextY) * POS_STRENGTH;
+                const targetAngle = lane.dir > 0 ? 0 : 180;
+                p.angle += snapAngleDiff(targetAngle, p.angle) * ANGLE_STRENGTH;
+                break;
+              }
+            }
+          } else {
+            // 垂直車道吸附：只吸附「行駛方向相符」的車道
+            for (let lane of ROAD_LANES.vLanes) {
+              const dirMatch = (lane.dir > 0 && sinA > 0) || (lane.dir < 0 && sinA < 0);
+              if (!dirMatch) continue;
+              if (Math.abs(nextX - lane.x) < SNAP_RANGE) {
+                nextX += (lane.x - nextX) * POS_STRENGTH;
+                const targetAngle = lane.dir > 0 ? 90 : -90;
+                p.angle += snapAngleDiff(targetAngle, p.angle) * ANGLE_STRENGTH;
+                break;
+              }
+            }
+          }
+        }
+      }
+
       let hit = false;
-      if (nextX < 0 || nextX > CANVAS_W || nextY < 0 || nextY > CANVAS_H) hit = true;
+      if (nextX < 0 || nextX > CANVAS_W || nextY < 0 || nextY > CANVAS_H) {
+        hit = true;
+        if (!p._prevHitBoundary) p.crashes += 1;
+        p._prevHitBoundary = true;
+      } else {
+        p._prevHitBoundary = false;
+      }
 
       for (let obj of currentRoom.objects) {
         if (obj.type === 'parking') continue;
         if (nextX > obj.x - 10 && nextX < obj.x + obj.w + 10 &&
-          nextY > obj.y - 10 && nextY < obj.y + obj.h + 10) hit = true;
+          nextY > obj.y - 10 && nextY < obj.y + obj.h + 10) {
+          hit = true;
+          if (!p._prevHitBuilding) p.crashes += 1;
+          p._prevHitBuilding = true;
+        }
       }
+      if (!hit) p._prevHitBuilding = false;
+
       // 施工區：矩形碰撞，行進方向加車身邊界 12px，橫向不加（避免擋到對向車道）
       let hitConstruction = false;
       for (let eo of (currentRoom.eventObjects || [])) {
         let ex, ey, ew, eh;
         if (eo.laneY !== undefined) {
-          // 水平車道：x 方向（行進）加 12，y 方向（橫向）不加
           ex = eo.x - 12; ew = eo.w + 24;
           ey = eo.y;      eh = eo.h;
         } else {
-          // 垂直車道：y 方向（行進）加 12，x 方向（橫向）不加
           ex = eo.x;      ew = eo.w;
           ey = eo.y - 12; eh = eo.h + 24;
         }
         if (nextX > ex && nextX < ex + ew && nextY > ey && nextY < ey + eh) hitConstruction = true;
       }
-      // DEBUG：每50 tick 印一次
-      if (currentRoom.tick % 50 === 0 && Object.keys(currentRoom.players).length > 0) {
-        console.log('[DEBUG] eventObjects:', JSON.stringify(currentRoom.eventObjects));
-        console.log('[DEBUG] player pos:', nextX.toFixed(1), nextY.toFixed(1));
-      }
+
       // 行人穿越：撞到記 eventPenalties 扣分
       let hitPedestrian = false;
       for (let npc of currentRoom.npcs) {
@@ -835,13 +935,15 @@ setInterval(() => {
       }
 
       if (hitConstruction || hit) {
-        if (hitConstruction && !p._prevHitConstruction) p.crashes += 1; // 撞施工區扣分一次
+        if (hitConstruction && !p._prevHitConstruction) p.crashes += 1;
         p._prevHitConstruction = hitConstruction;
         p.speed = 0;
+        p.steering = 0; // ── Bug 3 修正：碰撞時同步清除方向盤，防止角度繼續偏移 ──
       } else if (hitPedestrian) {
-        if (!p._prevHitPedestrian) p.eventPenalties += 1; // 撞行人扣分一次（不重複）
+        if (!p._prevHitPedestrian) p.eventPenalties += 1;
         p._prevHitPedestrian = true;
         p.speed = 0;
+        p.steering = 0; // ── Bug 3 修正：同上 ──
       } else {
         p._prevHitConstruction = false;
         p._prevHitPedestrian = false;
@@ -849,20 +951,120 @@ setInterval(() => {
         p.y = nextY;
       }
 
-      p.sensors = {
-        f: castRay(p.x, p.y, p.angle,       currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects),
-        l: castRay(p.x, p.y, p.angle - 45,  currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects),
-        r: castRay(p.x, p.y, p.angle + 45,  currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects),
-        fl: castRay(p.x, p.y, p.angle - 90, currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects),
-        fr: castRay(p.x, p.y, p.angle + 90, currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects),
-        
-      };
+      p.sensors = castAllSensors(p, currentRoom);
 // 新增：AI 視覺辨識與行為預測
       p.vision = castVisionRay(p.x, p.y, p.angle, currentRoom.objects, currentRoom.npcs, currentRoom.eventObjects);
-      // 新增：高精度地圖 GPS 座標
-      p.gps = { x: p.x, y: p.y };
+      p.gps = { x: Math.round(p.x), y: Math.round(p.y) };
+
+      // ── 闖紅燈偵測（越線瞬間判斷版）──
+      // 核心邏輯：偵測「車子這個 tick 是否剛剛越過停車線」
+      // 越線瞬間燈是紅的才罰，避免「綠燈進入路口途中燈變紅」的誤判
+      if (Math.abs(p.speed) > 0.3) {
+        const rad  = p.angle * Math.PI / 180;
+        const dirX = Math.cos(rad), dirY = Math.sin(rad);
+        const STOP_GAP = 28; // 停車線距路口中心距離
+
+        if (!p._rlState) p._rlState = {}; // 每個路口的越線狀態
+
+        let violated = false;
+        for (let tl of currentRoom.trafficLights) {
+          const key = tl.id;
+          let distToLine = 0, inLane = false;
+
+          if (tl.dir === 'EW' && Math.abs(dirX) > 0.5) {
+            distToLine = dirX > 0
+              ? p.x - (tl.cx - STOP_GAP)   // 往右：距左停車線
+              : (tl.cx + STOP_GAP) - p.x;  // 往左：距右停車線
+            inLane = Math.abs(p.y - tl.cy) < 28; // 收緊到單車道寬度
+          } else if (tl.dir === 'NS' && Math.abs(dirY) > 0.5) {
+            distToLine = dirY > 0
+              ? p.y - (tl.cy - STOP_GAP)
+              : (tl.cy + STOP_GAP) - p.y;
+            inLane = Math.abs(p.x - tl.cx) < 28;
+          }
+
+          const wasBeforeLine = !p._rlState[key]; // 上個 tick 在停車線前
+          const nowCrossed    = inLane && distToLine > 0 && distToLine < 35;
+
+          if (nowCrossed) {
+            // 越線瞬間（上一tick在線前，這一tick越過）且是紅燈 → 違規
+            if (wasBeforeLine && tl.state === 'red') {
+              violated = true;
+            }
+            p._rlState[key] = true; // 標記已越過此路口停車線
+          } else if (inLane && distToLine <= 0) {
+            // 車子在停車線前方，重置此路口狀態
+            p._rlState[key] = false;
+          } else if (!inLane) {
+            // 離開此路口車道，重置
+            p._rlState[key] = false;
+          }
+        }
+
+        if (violated) {
+          if (!p._prevRunRedLight) p.eventPenalties += 1;
+          p._prevRunRedLight = true;
+        } else {
+          let nearLight = currentRoom.trafficLights.some(
+            tl => Math.hypot(p.x - tl.cx, p.y - tl.cy) < 80
+          );
+          if (!nearLight) p._prevRunRedLight = false;
+        }
+      }
+
+      // ── 逆向行駛偵測（修正版）──
+      // 容差放寬至 ±20px（原 ±12px 在交叉口必誤判）
+      // 交叉口區域（±45px 內）完全豁免，避免轉彎被誤判
+      if (Math.abs(p.speed) > 0.5) {
+        const rad  = p.angle * Math.PI / 180;
+        const dirX = Math.cos(rad), dirY = Math.sin(rad);
+
+        // 是否在交叉口區域（豁免逆向偵測）
+        const atIntersection = currentRoom.trafficLights.some(
+          tl => Math.hypot(p.x - tl.cx, p.y - tl.cy) < 50
+        );
+
+        let wrongWay = false;
+        if (!atIntersection) {
+          const H_DIR = [{y:35,dir:-1},{y:60,dir:1},{y:275,dir:-1},{y:300,dir:1},{y:515,dir:-1},{y:540,dir:1}];
+          const V_DIR = [{x:35,dir:1},{x:65,dir:-1},{x:275,dir:1},{x:305,dir:-1},{x:515,dir:1},{x:545,dir:-1},{x:755,dir:1},{x:785,dir:-1}];
+
+          for (let lane of H_DIR) {
+            if (Math.abs(p.y - lane.y) < 15) {  // 容差縮小至 ±15px（吸附修正後更精準）
+              if (Math.abs(dirX) > 0.7 && Math.sign(dirX) !== lane.dir) wrongWay = true;
+              break;
+            }
+          }
+          for (let lane of V_DIR) {
+            if (Math.abs(p.x - lane.x) < 15) {
+              if (Math.abs(dirY) > 0.7 && Math.sign(dirY) !== lane.dir) wrongWay = true;
+              break;
+            }
+          }
+        }
+
+        if (wrongWay) {
+          if (!p._prevWrongWay) p.eventPenalties += 1;
+          p._prevWrongWay = true;
+        } else {
+          p._prevWrongWay = false;
+        }
+      }
+
+      // ── 即時得分計算（改良版）──
+      // 滿分 200，完成 +100，碰撞 -15，違規事件 -10
+      // 不設下限 0，讓學生清楚看到負分的後果
+      p.score = 200
+        - (p.crashes        || 0) * 15
+        - (p.eventPenalties || 0) * 10
+        + (p.finished ? 100 : 0);
+
       let g = currentRoom.goal;
-      if (!p.finished && p.x > g.x && p.x < g.x + g.w && p.y > g.y && p.y < g.y + g.h) {
+      // goal 偵測：車子中心進入終點範圍（含 12px 容差，讓車子「接近」終點就算到達）
+      const CAR_RADIUS = 12;
+      if (!p.finished &&
+          p.x > g.x - CAR_RADIUS && p.x < g.x + g.w + CAR_RADIUS &&
+          p.y > g.y - CAR_RADIUS && p.y < g.y + g.h + CAR_RADIUS) {
         p.finished = true;
       }
     }
@@ -870,11 +1072,22 @@ setInterval(() => {
     // 廣播房間狀態
     io.to(currentRoom.roomId).emit('state', {
       players: currentRoom.players,
-      npcs: currentRoom.npcs,
+      npcs:    currentRoom.npcs,
       trafficLights: currentRoom.trafficLights,
-      tick: currentRoom.tick
+      tick:    currentRoom.tick
     });
   }
 }, 50);
+
+// 空房間定期清理
+setInterval(() => {
+  for (let roomId in rooms) {
+    const room = rooms[roomId];
+    if (Object.keys(room.players).length === 0 && roomId !== 'default') {
+      delete rooms[roomId];
+      console.log(`[清理] 空房間 ${roomId} 已移除`);
+    }
+  }
+}, 5 * 60 * 1000);
 
 http.listen(3000, () => console.log('✅ 優化版智慧交通模擬伺服器已啟動！(Port 3000)'));
